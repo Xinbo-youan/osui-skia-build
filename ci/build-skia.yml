@@ -1,0 +1,91 @@
+# 用法：把本文件复制到 .github/workflows/build-skia.yml 并 push 即触发。
+# 需要 push 的 token 具备 workflow 权限。
+name: build-skia-d3d12
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: init-status
+        shell: pwsh
+        run: |
+          git config user.name "osui-bot"
+          git config user.email "bot@example.com"
+          "STATUS: RUNNING $(Get-Date -Format o)" | Out-File STATUS.md -Encoding utf8
+          git add STATUS.md; git commit -m "status: running [skip ci]"; git push origin HEAD:main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: fetch-depot-tools-and-skia
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
+          echo "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $env:PATH = "C:\depot_tools;" + $env:PATH
+          git clone https://skia.googlesource.com/skia.git C:\skia
+          Set-Location C:\skia
+          git rev-parse HEAD | Out-File VERSION.txt -Encoding utf8
+          python tools/git-sync-deps *>&1 | Tee-Object -FilePath C:\skia\sync.log
+          "STATUS: SYNCED $(Get-Date -Format o)" | Out-File STATUS.md -Encoding utf8
+          Set-Location $env:GITHUB_WORKSPACE
+          git add STATUS.md; git commit -m "status: synced [skip ci]"; git push origin HEAD:main
+      - name: gn-gen
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\depot_tools;" + $env:PATH
+          Set-Location C:\skia
+          $gnargs = 'is_official_build=false is_debug=false target_cpu="x64" is_clang=false cc="cl" cxx="cl" skia_enable_ganesh=true skia_use_direct3d=true skia_use_dawn=false skia_use_harfbuzz=true skia_use_icu=true skia_enable_skparagraph=true skia_use_freetype=true is_component_build=false'
+          gn gen out\Rel "--args=$gnargs" *>&1 | Tee-Object -FilePath C:\skia\gn.log
+          Copy-Item out\Rel\args.gn C:\skia\args_actual.gn
+      - name: ninja-build
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\depot_tools;" + $env:PATH
+          Set-Location C:\skia
+          ninja -C out\Rel skia skparagraph skshaper skunicode *>&1 | Tee-Object -FilePath C:\skia\build.log
+          Set-Location $env:GITHUB_WORKSPACE
+          "STATUS: BUILT $(Get-Date -Format o)" | Out-File STATUS.md -Encoding utf8
+          git add STATUS.md; git commit -m "status: built [skip ci]"; git push origin HEAD:main
+      - name: package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force stage\include,stage\lib | Out-Null
+          Copy-Item C:\skia\out\Rel\*.lib stage\lib\ -ErrorAction SilentlyContinue
+          Copy-Item C:\skia\out\Rel\args.gn stage\args.gn -ErrorAction SilentlyContinue
+          Copy-Item C:\skia\args_actual.gn stage\args_actual.gn -ErrorAction SilentlyContinue
+          Copy-Item C:\skia\VERSION.txt stage\VERSION.txt -ErrorAction SilentlyContinue
+          Copy-Item C:\skia\include stage\include\skia -Recurse
+          Copy-Item C:\skia\modules\skparagraph\include stage\include\skparagraph -Recurse
+          Copy-Item C:\skia\modules\skshaper\include stage\include\skshaper -Recurse
+          Copy-Item C:\skia\modules\skunicode\include stage\include\skunicode -Recurse
+          Compress-Archive -Path stage\* -DestinationPath skia-d3d12-x64.zip -Force
+          (Get-FileHash skia-d3d12-x64.zip -Algorithm SHA256).Hash | Out-File skia-d3d12-x64.zip.sha256 -Encoding utf8
+      - name: release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: skia-${{ github.run_id }}
+          name: skia-d3d12-x64-${{ github.run_id }}
+          files: |
+            skia-d3d12-x64.zip
+            skia-d3d12-x64.zip.sha256
+      - name: report
+        if: always()
+        shell: pwsh
+        run: |
+          $st = "${{ job.status }}"
+          $sha = ""
+          if (Test-Path skia-d3d12-x64.zip.sha256) { $sha = (Get-Content skia-d3d12-x64.zip.sha256 -Raw) }
+          "STATUS: $st $(Get-Date -Format o)`nrun_id=${{ github.run_id }}`nsha256=$sha" | Out-File STATUS.md -Encoding utf8
+          New-Item -ItemType Directory -Force logs | Out-Null
+          Copy-Item C:\skia\sync.log,C:\skia\gn.log,C:\skia\build.log logs\ -ErrorAction SilentlyContinue
+          git add STATUS.md logs; git commit -m "status: $st [skip ci]"; git push origin HEAD:main
